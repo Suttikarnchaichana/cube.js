@@ -255,7 +255,7 @@ impl RocksMetaStoreFs {
             let path_to_log = self.remote_fs.local_file(log_file).await?;
             let batch = WriteBatchContainer::read_from_file(&path_to_log).await;
             if let Ok(batch) = batch {
-                let db = meta_store.db.clone();
+                let db = meta_store.store.db.clone();
                 db.write(batch.write_batch())?;
             } else if let Err(e) = batch {
                 error!(
@@ -275,7 +275,9 @@ impl RocksMetaStoreFs {
         if let Some(snapshot) = snapshot {
             self.load_metastore_logs(snapshot, &meta_store).await?;
         }
-        RocksMetaStore::check_all_indexes(&meta_store).await?;
+
+        // TODO: OVR FIX
+        // RocksMetaStore::check_all_indexes(&meta_store).await?;
 
         Ok(meta_store)
     }
