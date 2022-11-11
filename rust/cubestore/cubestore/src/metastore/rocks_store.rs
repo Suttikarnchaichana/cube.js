@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
-use std::marker::PhantomData;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -313,9 +313,9 @@ pub trait MetaStoreTable: Send + Sync {
 
 #[macro_export]
 macro_rules! meta_store_table_impl {
-    ($name: ident, $table: ty, $rocks_table: ident, $rocks_meta_store: ty) => {
+    ($name: ident, $table: ty, $rocks_table: ident) => {
         pub struct $name {
-            rocks_meta_store: Arc<$rocks_meta_store>,
+            rocks_meta_store: Arc<BaseMetaStore>,
         }
 
         impl $name {
@@ -351,8 +351,14 @@ macro_rules! meta_store_table_impl {
     };
 }
 
+pub trait BaseMetaStoreDetails: Send + Sync {
+    fn open_db(&self, path: &Path) -> Result<DB, CubeError>;
+    fn migrate<'a>(&self, table_ref: DbTableRef<'a>) -> Result<(), CubeError>;
+    fn meta_store_path(&self, checkpoint_time: &SystemTime) -> String;
+}
+
 #[derive(Clone)]
-pub struct BaseMetaStore<T: DatabaseMethods + Send + Sync + 'static> {
+pub struct BaseMetaStore {
     pub db: Arc<DB>,
     pub config: Arc<dyn ConfigObj>,
     seq_store: Arc<Mutex<HashMap<TableId, u64>>>,
@@ -368,13 +374,7 @@ pub struct BaseMetaStore<T: DatabaseMethods + Send + Sync + 'static> {
         Box<dyn FnOnce() -> Result<(), CubeError> + Send + Sync + 'static>,
     >,
     _rw_loop_join_handle: Arc<AbortingJoinHandle<()>>,
-    _methods: PhantomData<T>,
-}
-
-pub trait DatabaseMethods {
-    fn open_db(path: impl AsRef<Path>) -> Result<DB, CubeError>;
-    fn migrate<'a>(table_ref: DbTableRef<'a>) -> Result<(), CubeError>;
-    fn meta_store_path(checkpoint_time: &SystemTime) -> String;
+    details: Arc<dyn BaseMetaStoreDetails>,
 }
 
 pub fn check_if_exists(name: &String, existing_keys_len: usize) -> Result<(), CubeError> {
@@ -391,24 +391,27 @@ pub fn check_if_exists(name: &String, existing_keys_len: usize) -> Result<(), Cu
     Ok(())
 }
 
-impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
+impl BaseMetaStore {
     pub fn with_listener(
-        path: impl AsRef<Path>,
+        path: &Path,
         listeners: Vec<Sender<MetaStoreEvent>>,
         metastore_fs: Arc<dyn MetaStoreFs>,
         config: Arc<dyn ConfigObj>,
-    ) -> Arc<BaseMetaStore<T>> {
-        let meta_store = BaseMetaStore::with_listener_impl(path, listeners, metastore_fs, config);
+        details: Arc<dyn BaseMetaStoreDetails>,
+    ) -> Arc<BaseMetaStore> {
+        let meta_store =
+            BaseMetaStore::with_listener_impl(path, listeners, metastore_fs, config, details);
         Arc::new(meta_store)
     }
 
     pub fn with_listener_impl(
-        path: impl AsRef<Path>,
+        path: &Path,
         listeners: Vec<Sender<MetaStoreEvent>>,
         metastore_fs: Arc<dyn MetaStoreFs>,
         config: Arc<dyn ConfigObj>,
-    ) -> BaseMetaStore<T> {
-        let db = T::open_db(path).unwrap();
+        details: Arc<dyn BaseMetaStoreDetails>,
+    ) -> BaseMetaStore {
+        let db = details.open_db(path).unwrap();
         let db_arc = Arc::new(db);
 
         let (rw_loop_tx, rw_loop_rx) = std::sync::mpsc::sync_channel::<
@@ -442,26 +445,29 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
             cached_tables: Arc::new(Mutex::new(None)),
             rw_loop_tx,
             _rw_loop_join_handle: Arc::new(AbortingJoinHandle::new(join_handle)),
-            _methods: Default::default(),
+            details,
         };
+
         meta_store
     }
 
     pub fn new(
-        path: impl AsRef<Path>,
+        path: &Path,
         metastore_fs: Arc<dyn MetaStoreFs>,
         config: Arc<dyn ConfigObj>,
-    ) -> Arc<BaseMetaStore<T>> {
-        Self::with_listener(path, vec![], metastore_fs, config)
+        details: Arc<dyn BaseMetaStoreDetails>,
+    ) -> Arc<BaseMetaStore> {
+        Self::with_listener(path, vec![], metastore_fs, config, details)
     }
 
     pub async fn load_from_dump(
-        path: impl AsRef<Path>,
-        dump_path: impl AsRef<Path>,
+        path: &Path,
+        dump_path: &Path,
         metastore_fs: Arc<dyn MetaStoreFs>,
         config: Arc<dyn ConfigObj>,
-    ) -> Result<Arc<BaseMetaStore<T>>, CubeError> {
-        if !fs::metadata(path.as_ref()).await.is_ok() {
+        details: Arc<dyn BaseMetaStoreDetails>,
+    ) -> Result<Arc<BaseMetaStore>, CubeError> {
+        if !fs::metadata(path).await.is_ok() {
             let mut backup =
                 rocksdb::backup::BackupEngine::open(&BackupEngineOptions::default(), dump_path)?;
             backup.restore_from_latest_backup(
@@ -472,18 +478,18 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
         } else {
             info!(
                 "Using existing metastore in {}",
-                path.as_ref().as_os_str().to_string_lossy()
+                path.as_os_str().to_string_lossy()
             );
         }
 
-        let meta_store = Self::new(path, metastore_fs, config);
+        let meta_store = Self::new(path, metastore_fs, config, details);
 
         BaseMetaStore::check_all_indexes(&meta_store).await?;
 
         Ok(meta_store)
     }
 
-    pub async fn check_all_indexes(meta_store: &Arc<BaseMetaStore<T>>) -> Result<(), CubeError> {
+    pub async fn check_all_indexes(meta_store: &Arc<BaseMetaStore>) -> Result<(), CubeError> {
         let meta_store_to_move = meta_store.clone();
 
         cube_ext::spawn_blocking(move || {
@@ -493,7 +499,7 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
                 mem_seq: MemorySequence::new(meta_store_to_move.seq_store.clone()),
             };
 
-            if let Err(e) = T::migrate(table_ref) {
+            if let Err(e) = meta_store_to_move.details.migrate(table_ref) {
                 log::error!("Error during checking indexes: {}", e);
             }
         })
@@ -607,7 +613,7 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
             let checkpoint_time = self.last_checkpoint_time.read().await;
             let log_name = format!(
                 "{}-logs/{}.flex",
-                T::meta_store_path(&checkpoint_time),
+                self.details.meta_store_path(&checkpoint_time),
                 min.unwrap()
             );
             self.metastore_fs.upload_log(&log_name, &serializer).await?;
@@ -640,9 +646,9 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
         let mut check_point_time = self.last_checkpoint_time.write().await;
 
         let (remote_path, checkpoint_path) = {
-            let db = self.db.clone();
+            let _db = self.db.clone();
             *check_point_time = SystemTime::now();
-            Self::prepare_checkpoint(db, &check_point_time).await?
+            self.prepare_checkpoint(&check_point_time).await?
         };
 
         self.metastore_fs
@@ -661,18 +667,22 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
     }
 
     async fn prepare_checkpoint(
-        db: Arc<DB>,
+        &self,
         checkpoint_time: &SystemTime,
     ) -> Result<(String, PathBuf), CubeError> {
-        let remote_path = T::meta_store_path(checkpoint_time);
-        let checkpoint_path = db.path().join("..").join(remote_path.clone());
+        let remote_path = self.details.meta_store_path(checkpoint_time);
+        let checkpoint_path = self.db.path().join("..").join(remote_path.clone());
+
         let path_to_move = checkpoint_path.clone();
+        let db_to_move = self.db.clone();
+
         cube_ext::spawn_blocking(move || -> Result<(), CubeError> {
-            let checkpoint = Checkpoint::new(db.as_ref())?;
+            let checkpoint = Checkpoint::new(db_to_move.as_ref())?;
             checkpoint.create_checkpoint(path_to_move.as_path())?;
             Ok(())
         })
         .await??;
+
         Ok((remote_path, checkpoint_path))
     }
 
@@ -746,7 +756,8 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
 
     pub fn prepare_test_metastore(
         test_name: &str,
-    ) -> (Arc<LocalDirRemoteFs>, Arc<BaseMetaStore<T>>) {
+        details: Arc<dyn BaseMetaStoreDetails>,
+    ) -> (Arc<LocalDirRemoteFs>, Arc<BaseMetaStore>) {
         let config = Config::test(test_name);
         let store_path = env::current_dir()
             .unwrap()
@@ -761,6 +772,7 @@ impl<T: DatabaseMethods + Send + Sync + 'static> BaseMetaStore<T> {
             store_path.clone().join("metastore").as_path(),
             RocksMetaStoreFs::new(remote_fs.clone()),
             config.config_obj(),
+            details,
         );
         (remote_fs, meta_store)
     }

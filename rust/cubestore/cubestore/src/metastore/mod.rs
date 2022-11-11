@@ -632,36 +632,11 @@ pub struct WAL {
     uploaded: bool,
 }
 
-meta_store_table_impl!(
-    SchemaMetaStoreTable,
-    Schema,
-    SchemaRocksTable,
-    RocksMetaStoreDatabase
-);
-meta_store_table_impl!(
-    ChunkMetaStoreTable,
-    Chunk,
-    ChunkRocksTable,
-    RocksMetaStoreDatabase
-);
-meta_store_table_impl!(
-    IndexMetaStoreTable,
-    Index,
-    IndexRocksTable,
-    RocksMetaStoreDatabase
-);
-meta_store_table_impl!(
-    PartitionMetaStoreTable,
-    Partition,
-    PartitionRocksTable,
-    RocksMetaStoreDatabase
-);
-meta_store_table_impl!(
-    TableMetaStoreTable,
-    Table,
-    TableRocksTable,
-    RocksMetaStoreDatabase
-);
+meta_store_table_impl!(SchemaMetaStoreTable, Schema, SchemaRocksTable);
+meta_store_table_impl!(ChunkMetaStoreTable, Chunk, ChunkRocksTable);
+meta_store_table_impl!(IndexMetaStoreTable, Index, IndexRocksTable);
+meta_store_table_impl!(PartitionMetaStoreTable, Partition, PartitionRocksTable);
+meta_store_table_impl!(TableMetaStoreTable, Table, TableRocksTable);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PartitionData {
@@ -1007,8 +982,8 @@ fn meta_store_merge(
 
 pub struct RocksMetaStoreDetails {}
 
-impl DatabaseMethods for RocksMetaStoreDetails {
-    fn open_db(path: impl AsRef<Path>) -> Result<DB, CubeError> {
+impl BaseMetaStoreDetails for RocksMetaStoreDetails {
+    fn open_db(&self, path: &Path) -> Result<DB, CubeError> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(13));
@@ -1017,7 +992,7 @@ impl DatabaseMethods for RocksMetaStoreDetails {
         Ok(DB::open(&opts, path).unwrap())
     }
 
-    fn migrate<'a>(table_ref: DbTableRef<'a>) -> Result<(), CubeError> {
+    fn migrate<'a>(&self, table_ref: DbTableRef<'a>) -> Result<(), CubeError> {
         SchemaRocksTable::new(table_ref.clone()).check_indexes()?;
         TableRocksTable::new(table_ref.clone()).check_indexes()?;
         IndexRocksTable::new(table_ref.clone()).check_indexes()?;
@@ -1032,7 +1007,7 @@ impl DatabaseMethods for RocksMetaStoreDetails {
         Ok(())
     }
 
-    fn meta_store_path(checkpoint_time: &SystemTime) -> String {
+    fn meta_store_path(&self, checkpoint_time: &SystemTime) -> String {
         format!(
             "metastore-{}",
             checkpoint_time
@@ -1043,51 +1018,43 @@ impl DatabaseMethods for RocksMetaStoreDetails {
     }
 }
 
-pub type RocksMetaStoreDatabase = BaseMetaStore<RocksMetaStoreDetails>;
-
 pub struct RocksMetaStore {
-    store: Arc<RocksMetaStoreDatabase>,
+    store: Arc<BaseMetaStore>,
     upload_loop: Arc<WorkerLoop>,
 }
 
 impl RocksMetaStore {
     pub fn new(
-        path: impl AsRef<Path>,
+        path: &Path,
         metastore_fs: Arc<dyn MetaStoreFs>,
         config: Arc<dyn ConfigObj>,
     ) -> Arc<RocksMetaStore> {
         Arc::new(RocksMetaStore {
-            store: BaseMetaStore::with_listener(path, vec![], metastore_fs, config),
+            store: BaseMetaStore::with_listener(
+                path,
+                vec![],
+                metastore_fs,
+                config,
+                Arc::new(RocksMetaStoreDetails {}),
+            ),
             upload_loop: Arc::new(WorkerLoop::new("Metastore upload")),
         })
     }
 
-    pub async fn add_listener(&self, listener: Sender<MetaStoreEvent>) {
-        self.store.add_listener(listener).await;
-    }
-
-    pub fn prepare_test_metastore(test_name: &str) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
-        let (local_dir, store) = RocksMetaStoreDatabase::prepare_test_metastore(test_name);
-        (
-            local_dir,
-            Arc::new(RocksMetaStore {
-                store,
-                upload_loop: Arc::new(WorkerLoop::new("Metastore upload")),
-            }),
-        )
-    }
-
-    pub fn cleanup_test_metastore(test_name: &str) {
-        RocksMetaStoreDatabase::cleanup_test_metastore(test_name)
-    }
-
     pub async fn load_from_dump(
-        path: impl AsRef<Path>,
-        dump_path: impl AsRef<Path>,
+        path: &Path,
+        dump_path: &Path,
         metastore_fs: Arc<dyn MetaStoreFs>,
         config: Arc<dyn ConfigObj>,
     ) -> Result<Arc<RocksMetaStore>, CubeError> {
-        let store = BaseMetaStore::load_from_dump(path, dump_path, metastore_fs, config).await?;
+        let store = BaseMetaStore::load_from_dump(
+            path,
+            dump_path,
+            metastore_fs,
+            config,
+            Arc::new(RocksMetaStoreDetails {}),
+        )
+        .await?;
 
         Ok(Arc::new(RocksMetaStore {
             store,
@@ -1114,6 +1081,38 @@ impl RocksMetaStore {
 
     pub async fn stop_processing_loops(&self) {
         self.upload_loop.stop();
+    }
+
+    pub async fn add_listener(&self, listener: Sender<MetaStoreEvent>) {
+        self.store.add_listener(listener).await;
+    }
+
+    pub fn prepare_test_metastore(test_name: &str) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
+        let (local_dir, store) =
+            BaseMetaStore::prepare_test_metastore(test_name, Arc::new(RocksMetaStoreDetails {}));
+        (
+            local_dir,
+            Arc::new(RocksMetaStore {
+                store,
+                upload_loop: Arc::new(WorkerLoop::new("Metastore upload")),
+            }),
+        )
+    }
+
+    pub fn cleanup_test_metastore(test_name: &str) {
+        BaseMetaStore::cleanup_test_metastore(test_name)
+    }
+
+    pub async fn run_upload(&self) -> Result<(), CubeError> {
+        self.store.run_upload().await
+    }
+
+    pub async fn upload_check_point(&self) -> Result<(), CubeError> {
+        self.store.upload_check_point().await
+    }
+
+    pub async fn has_pending_changes(&self) -> Result<bool, CubeError> {
+        self.store.has_pending_changes().await
     }
 }
 
@@ -4128,6 +4127,7 @@ mod tests {
                 .unwrap();
 
             meta_store
+                .store
                 .db
                 .delete(RowKey::Table(TableId::Schemas, 1).to_bytes())
                 .unwrap();
@@ -4136,7 +4136,7 @@ mod tests {
             println!("{:?}", result);
             assert_eq!(result.is_err(), true);
 
-            let iterator = meta_store.db.iterator(IteratorMode::Start);
+            let iterator = meta_store.store.db.iterator(IteratorMode::Start);
 
             println!("Keys in db");
             for (key, _) in iterator {

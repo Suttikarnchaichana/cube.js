@@ -74,7 +74,7 @@ impl MetaStoreFs for RocksMetaStoreFs {
 
                     return self
                         .check_meta_store(
-                            RocksMetaStore::new(path, self.clone(), config),
+                            RocksMetaStore::new(Path::new(path), self.clone(), config),
                             Some(snapshot),
                         )
                         .await;
@@ -88,7 +88,10 @@ impl MetaStoreFs for RocksMetaStoreFs {
         }
 
         return self
-            .check_meta_store(RocksMetaStore::new(path, self.clone(), config), None)
+            .check_meta_store(
+                RocksMetaStore::new(Path::new(path), self.clone(), config),
+                None,
+            )
             .await;
     }
 
